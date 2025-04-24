@@ -1,0 +1,39 @@
+# Go
+*.exe
+*.test
+*.out
+*.so
+*.dSYM
+bin/
+vendor/
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+venv/
+.env/
+*.egg-info/
+*.log
+
+# Editor de código (VS Code)
+.vscode/
+
+# Arquivos de ambiente (venv, etc)
+*.env
+env/
+venv/
+.venv/
+
+# Arquivos temporários
+*.swp
+*.swo
+*~
+
+# Arquivos gerados
+*.db
+*.sqlite
+
+# Outros
+.DS_Store
