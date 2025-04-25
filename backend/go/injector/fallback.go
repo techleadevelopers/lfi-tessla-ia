@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -426,4 +425,41 @@ func NewHTTPClient(host string) *http.Client {
 // stub de MLModel loading
 func LoadMLModel() *MLModel {
 	return &MLModel{Scores: make(map[string]float64)}
+}
+
+// -----------------------------
+// Fallback simples (main.go depende disso)
+// -----------------------------
+
+type FallbackResult struct {
+	Success bool
+	Body    string
+	Reward  float64
+}
+
+// TentarFallback executa um GET direto com o payload.
+// Usado como último recurso quando o WAF bloqueia canais normais.
+func TentarFallback(url, payload string) FallbackResult {
+	req, err := http.NewRequest("GET", url+payload, nil)
+	if err != nil {
+		return FallbackResult{}
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return FallbackResult{}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if len(body) > 0 && resp.StatusCode != http.StatusForbidden {
+		return FallbackResult{
+			Success: true,
+			Body:    string(body),
+			Reward:  1.0,
+		}
+	}
+
+	return FallbackResult{}
 }

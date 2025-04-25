@@ -98,9 +98,10 @@ if errorlevel 1 (
 )
 
 :: Exibir Detecção de WAFs e Vazamentos a partir do Log
-for /f "delims=" %%A in (detection_log.txt) do (
+for /f "delims=" %%A in ("C:\Users\Paulo\Desktop\lfi-tessla-pro\backend\go\logs\detection_log.txt") do (
     echo %%A
 )
+
 
 :: Finalização
 echo  │ 🧹 [%time%] Realizando limpeza neural...

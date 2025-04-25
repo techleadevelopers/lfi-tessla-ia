@@ -1,4 +1,5 @@
-package stealthrouter
+// strategies/stealthrouter.go
+package strategies // Alterado para 'strategies' para corresponder à importação na main.go
 
 import (
 	"errors"
@@ -6,10 +7,7 @@ import (
 	"os"
 	"strings"
 	"time"
-)
 
-// 🔽 IMPORTS NECESSÁRIOS
-import (
 	"lfitessla/config"
 	"lfitessla/entropy"
 	"lfitessla/http2mux"

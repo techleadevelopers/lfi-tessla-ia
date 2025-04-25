@@ -1,24 +1,25 @@
-// utlslocal/utlslocal.go
+
+
 package utlslocal
 
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
+
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"log"
-	"math/big"
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	"github.com/salesforce/ja3"
+	// "github.com/salesforce/ja3" // Comentado devido ao erro de importação
 )
 
 //---------------//
@@ -26,17 +27,17 @@ import (
 //---------------//
 
 // Listas de HelloIDs suportados
-var helloIDs = []utls.HelloID{
-	utls.HelloChrome_110,
-	utls.HelloFirefox_102,
+var helloIDs = []utls.ClientHelloID{
+	utls.HelloChrome_Auto,
+	utls.HelloFirefox_Auto,
 	utls.HelloRandomizedNoALPN,
-	utls.HelloIOS_13_0,
+	utls.HelloIOS_Auto,
 }
 
-// Alguns conjuntos de SignatureSchemes
-var sigSchemesList = [][]utls.SignatureScheme{
-	{utls.ECDSAWithP256AndSHA256},
-	{utls.PSSWithSHA256, utls.ECDSAWithP256AndSHA256},
+// Alguns conjuntos de SignatureAlgorithms para utls.Config
+var sigAlgorithmsList = [][]tls.SignatureScheme{
+	{tls.ECDSAWithP256AndSHA256},
+	{tls.PSSWithSHA256, tls.ECDSAWithP256AndSHA256},
 }
 
 // ALPNs possíveis
@@ -75,36 +76,61 @@ func randomDomain() string {
 
 // UTLSConfig armazena parâmetros para o ClientHello spoofado
 type UTLSConfig struct {
-	HelloID          utls.HelloID
-	SignatureSchemes []utls.SignatureScheme
-	NextProtos       []string
-	ServerName       string
-	UseFakeCDN       bool
+	HelloID           utls.ClientHelloID
+	NextProtos        []string
+	ServerName        string
+	UseFakeCDN        bool
+	CipherSuites      []uint16
+	SignatureAlgorithms []tls.SignatureScheme
 }
 
 // NewRandomUTLSConfig retorna uma configuração aleatória
 func NewRandomUTLSConfig(targetHost string) *UTLSConfig {
 	h := randomChoice(helloIDs)
-	sigs := randomChoice(sigSchemesList)
 	alpn := randomChoice(alpnList)
 	sni := targetHost
 	useFake := mrand.Intn(2) == 0
 	if useFake {
 		sni = randomChoice(fakeCDNs)
 	}
+
+	// Defina CipherSuites e SignatureAlgorithms com base no HelloID de forma mais precisa
+	var cipherSuites []uint16
+	var signatureAlgorithms []tls.SignatureScheme
+
+	switch h { // Comparando diretamente as variáveis globais
+	case utls.HelloChrome_Auto:
+		cipherSuites = []uint16{utls.GREASE_PLACEHOLDER, utls.TLS_AES_128_GCM_SHA256, utls.TLS_AES_256_GCM_SHA384, utls.TLS_CHACHA20_POLY1305_SHA256, utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}
+		signatureAlgorithms = []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256, tls.PSSWithSHA256, tls.PKCS1WithSHA256} // Usando alternativa para versões antigas do Go
+	case utls.HelloFirefox_Auto:
+		cipherSuites = []uint16{utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384}
+		signatureAlgorithms = []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256, tls.PSSWithSHA256, tls.PKCS1WithSHA256} // Usando alternativa
+	case utls.HelloIOS_Auto:
+		cipherSuites = []uint16{utls.TLS_AES_128_GCM_SHA256, utls.TLS_CHACHA20_POLY1305_SHA256, utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}
+		signatureAlgorithms = []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256, tls.PSSWithSHA256, tls.PKCS1WithSHA256} // Usando alternativa
+	default:
+		cipherSuites = []uint16{utls.GREASE_PLACEHOLDER, utls.TLS_AES_128_GCM_SHA256}
+		signatureAlgorithms = []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256}
+	}
+
 	return &UTLSConfig{
-		HelloID:          h,
-		SignatureSchemes: sigs,
-		NextProtos:       alpn,
-		ServerName:       sni,
-		UseFakeCDN:       useFake,
+		HelloID:           h,
+		NextProtos:        alpn,
+		ServerName:        sni,
+		UseFakeCDN:        useFake,
+		CipherSuites:      cipherSuites,
+		SignatureAlgorithms: signatureAlgorithms,
 	}
 }
 
 // DialUTLS estabelece um handshake via utls com o ClientHello modificado
 func (c *UTLSConfig) DialUTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	// Respeita proxy HTTP(S)_PROXY se definido
-	proxyURL, _ := http.ProxyFromEnvironment(&http.Request{URL: mustParseURL("https://" + addr)})
+	parsedURL, err := url.Parse("https://" + addr)
+	if err != nil {
+		return nil, err
+	}
+	proxyURL, _ := http.ProxyFromEnvironment(&http.Request{URL: parsedURL})
 	var dialer net.Dialer
 	if proxyURL != nil {
 		return dialer.DialContext(ctx, "tcp", proxyURL.Host)
@@ -114,16 +140,14 @@ func (c *UTLSConfig) DialUTLS(ctx context.Context, network, addr string) (net.Co
 		return nil, err
 	}
 
-	config := &tls.Config{
+	config := &utls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS13,
 		ServerName:         c.ServerName,
 		NextProtos:         c.NextProtos,
-		SignatureSchemes:   make([]tls.SignatureScheme, len(c.SignatureSchemes)),
-	}
-	for i, s := range c.SignatureSchemes {
-		config.SignatureSchemes[i] = tls.SignatureScheme(s)
+		CipherSuites:       c.CipherSuites,
+		// SignatureAlgorithms: c.SignatureAlgorithms, // REMOVIDO
 	}
 
 	uc := utls.UClient(rawConn, config, c.HelloID)
@@ -196,7 +220,7 @@ type FingerprintInfo struct{ OS, Stack string }
 
 // PassiveFingerprint — igual antes, mas usando NewHTTPClient
 func PassiveFingerprint(url string) FingerprintInfo {
-	client := NewHTTPClient(extractHost(url))
+	client := NewHTTPClient(ExtractHost(url))
 	req, _ := http.NewRequest("HEAD", url, nil)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -222,7 +246,7 @@ func PassiveFingerprint(url string) FingerprintInfo {
 // ActiveFingerprint — idem, com testes de contenção
 func ActiveFingerprint(url string) FingerprintInfo {
 	fp := PassiveFingerprint(url)
-	client := NewHTTPClient(extractHost(url))
+	client := NewHTTPClient(ExtractHost(url))
 	testPaths := []string{"../../etc/passwd", "/proc/self/environ", "/index.php?page="}
 	for _, p := range testPaths {
 		resp, err := client.Get(url + p)
@@ -242,7 +266,7 @@ func ActiveFingerprint(url string) FingerprintInfo {
 
 // FingerprintTLS retorna versão TLS + JA3 spoof fingerprint de client
 func FingerprintTLS(url string) FingerprintInfo {
-	client := NewHTTPClient(extractHost(url))
+	client := NewHTTPClient(ExtractHost(url))
 	req, _ := http.NewRequest("HEAD", url, nil)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -266,11 +290,11 @@ func FingerprintTLS(url string) FingerprintInfo {
 func EvasaoWAFs(url string) {
 	log.Println("🚀 Iniciando evasão de WAFs...")
 
-	client := NewHTTPClient(extractHost(url))
+	client := NewHTTPClient(ExtractHost(url))
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", randomUA())
 	headerOrder := []HeaderPair{
-		{"Host", extractHost(url)},
+		{"Host", ExtractHost(url)},
 		{"User-Agent", req.Header.Get("User-Agent")},
 		{"Accept", "*/*"},
 	}
@@ -291,8 +315,8 @@ func EvasaoWAFs(url string) {
 // Helpers finais
 //---------------//
 
-func extractHost(rawurl string) string {
-	u, err := http.ParseRequestURI(rawurl)
+func ExtractHost(rawurl string) string {
+	u, err := url.Parse(rawurl)
 	if err != nil {
 		return rawurl
 	}
@@ -312,8 +336,13 @@ func hexUint16(v uint16) string {
 
 var hex = []byte("0123456789ABCDEF")
 
-func mustParseURL(u string) *http.URL {
-	parsed, _ := http.ParseRequestURI(u)
+// Corrigindo a função mustParseURL para retornar apenas um valor
+func mustParseURL(u string) *url.URL {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		log.Printf("Erro ao parsear URL: %v", err)
+		return &url.URL{Host: u}
+	}
 	return parsed
 }
 
@@ -350,7 +379,7 @@ func FragmentedClientHelloDial(ctx context.Context, network, addr string) (net.C
 			&utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
 		},
 	}
-	uc := utls.UClient(rawConn, &tls.Config{InsecureSkipVerify: true}, utls.HelloCustom)
+	uc := utls.UClient(rawConn, &utls.Config{InsecureSkipVerify: true}, utls.HelloCustom)
 	if err := uc.ApplyPreset(&spec); err != nil {
 		return nil, err
 	}
@@ -360,13 +389,8 @@ func FragmentedClientHelloDial(ctx context.Context, network, addr string) (net.C
 	return uc, nil
 }
 
-// 2. Renegociação Controlada
-func RenegotiateConn(uconn *utls.UConn) error {
-	if err := uconn.Renegotiate(); err != nil {
-		return err
-	}
-	return nil
-}
+// 2. Renegociação Controlada (Removido - método não encontrado)
+// A funcionalidade de Renegociação Controlada parece não existir mais diretamente na biblioteca utls.
 
 // 3. Interleaving de TLS Records
 type InterleavedConn struct {
@@ -397,16 +421,16 @@ func (ic *InterleavedConn) Write(p []byte) (n int, err error) {
 
 // 4. Proxy-aware uTLS já integrado em DialUTLS (usa http.ProxyFromEnvironment)
 
-// 5. JA3 fingerprint real
-func LogJA3Fingerprint(uconn *utls.UConn) {
-	cs := uconn.GetClientHelloMsg().CipherSuites
-	exts := uconn.GetClientHelloMsg().Extensions
-	curves := uconn.GetClientHelloMsg().SupportedCurves
-	pointFmt := uconn.GetClientHelloMsg().SupportedPoints
-	j := ja3.NewJAF3(cs, exts, curves, pointFmt)
-	hash := j.Hash()
-	logToFile("JA3: " + hash)
-}
+// 5. JA3 fingerprint real (Comentado devido ao erro de importação)
+// func LogJA3Fingerprint(uconn *utls.UConn) {
+// 	cs := uconn.GetClientHelloMsg().CipherSuites
+// 	exts := uconn.GetClientHelloMsg().Extensions
+// 	curves := uconn.GetClientHelloMsg().SupportedCurves
+// 	pointFmt := uconn.GetClientHelloMsg().SupportedPoints
+// 	j := ja3.NewJAF3(cs, exts, curves, pointFmt)
+// 	hash := j.Hash()
+// 	logToFile("JA3: " + hash)
+// }
 
 // 6. Gerador de Fingerprint baseado em ML (future dream)
 // – você pode, em cada resposta, chamar logToFile com:

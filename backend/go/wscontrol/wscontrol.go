@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"log"
 	"time"
-
-
 	"github.com/gorilla/websocket"
 )
 
+// Client encapsula a conexão WebSocket
 type Client struct {
 	conn *websocket.Conn
 }
@@ -23,17 +22,23 @@ func Connect(url string) (*Client, error) {
 }
 
 // Log envia um evento com nome e dados arbitrários
-func (c *Client) Log(event string, data ...interface{}) {
+func (c *Client) Log(event string, data ...interface{}) error {
 	msg := map[string]interface{}{
 		"event": event,
 		"data":  data,
 		"time":  time.Now().UTC(),
 	}
 	if b, err := json.Marshal(msg); err == nil {
-		c.conn.WriteMessage(websocket.TextMessage, b)
+		err := c.conn.WriteMessage(websocket.TextMessage, b)
+		if err != nil {
+			log.Println("wscontrol write error:", err)
+			return err
+		}
 	} else {
 		log.Println("wscontrol marshal error:", err)
+		return err
 	}
+	return nil
 }
 
 // Close encerra a conexão

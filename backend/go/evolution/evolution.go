@@ -74,13 +74,25 @@ func SelecionarTop(populacao []Gene, n int) []Gene {
 	}
 	return populacao[:n]
 }
-
-// Crossover entre dois genes
+// Crossover entre dois genes, seguro contra slice out-of-range
 func Crossover(p1, p2 Gene) Gene {
-	mid := len(p1.Payload) / 2
-	child := p1.Payload[:mid] + p2.Payload[mid:]
-	return Gene{Payload: child, Fitness: 0}
+    // escolhe o menor comprimento entre os dois payloads
+    minLen := len(p1.Payload)
+    if len(p2.Payload) < minLen {
+        minLen = len(p2.Payload)
+    }
+    // ponto de corte no meio desse menor comprimento
+    mid := minLen / 2
+
+    // fatie ambas as strings usando mid — nunca estoura
+    childPayload := p1.Payload[:mid] + p2.Payload[mid:]
+
+    return Gene{
+        Payload: childPayload,
+        Fitness: 0,
+    }
 }
+
 
 // Mutação aleatória
 func Mutate(g Gene) Gene {

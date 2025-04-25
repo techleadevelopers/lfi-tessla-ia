@@ -2,10 +2,10 @@ package analyzer
 
 import (
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
-	"golang.org/x/text/unicode/norm"
 )
 
 // DetectarWAF identifica padrões típicos de bloqueio ou presença de WAFs reais
@@ -14,46 +14,61 @@ func DetectarWAF(statusCode int, headers http.Header, body string) string {
 
 	// Status de bloqueio e padrões conhecidos
 	if statusCode == 403 || statusCode == 406 {
+		logWAFDetection("statusCode", "🔒 WAF detectado (status HTTP)", statusCode, headers)
 		return "🔒 WAF detectado (status HTTP)"
 	}
 	if strings.Contains(lowerBody, "access denied") || strings.Contains(lowerBody, "unauthorized access") {
+		logWAFDetection("access_denied", "🚫 Access Denied", statusCode, headers)
 		return "🚫 Access Denied"
 	}
 	if strings.Contains(lowerBody, "mod_security") || strings.Contains(lowerBody, "modsecurity") {
+		logWAFDetection("mod_security", "🛡️ ModSecurity", statusCode, headers)
 		return "🛡️ ModSecurity"
 	}
 	if matched, _ := regexp.MatchString(`cloudflare|akamai|imperva|sucuri|barracuda|f5`, lowerBody); matched {
+		logWAFDetection("cloudflare_akamai", "☁️ Cloud-based WAF detectado (corpo)", statusCode, headers)
 		return "☁️ Cloud-based WAF detectado (corpo)"
 	}
 
 	// Análise via headers
 	server := strings.ToLower(headers.Get("Server"))
 	if strings.Contains(server, "cloudflare") {
+		logWAFDetection("cloudflare", "☁️ Cloudflare (via header Server)", statusCode, headers)
 		return "☁️ Cloudflare (via header Server)"
 	}
 	if via := headers.Get("Via"); strings.Contains(strings.ToLower(via), "akamai") {
+		logWAFDetection("akamai", "☁️ Akamai (via header Via)", statusCode, headers)
 		return "☁️ Akamai (via header Via)"
 	}
 	if strings.EqualFold(headers.Get("X-CDN"), "Imperva") {
+		logWAFDetection("imperva", "☁️ Imperva (via X-CDN)", statusCode, headers)
 		return "☁️ Imperva (via X-CDN)"
 	}
 
 	// Fingerprinting de servidor
 	if strings.Contains(lowerBody, "nginx") || strings.Contains(lowerBody, "apache") {
+		logWAFDetection("fingerprinting", "🖥️ Fingerprinting detectado (corpo)", statusCode, headers)
 		return "🖥️ Fingerprinting detectado (corpo)"
 	}
 
 	// Novo: análise de cabeçalhos como X-Powered-By
 	if poweredBy := headers.Get("X-Powered-By"); poweredBy != "" {
+		logWAFDetection("x-powered-by", "🖥️ Fingerprinting detectado (header X-Powered-By)", statusCode, headers)
 		return "🖥️ Fingerprinting detectado (header X-Powered-By)"
 	}
 
 	// Análise comportamental adicional (latência ou comportamento específico de WAF)
 	if strings.Contains(lowerBody, "timeout") || strings.Contains(lowerBody, "request throttled") {
+		logWAFDetection("latency", "⏱️ WAF detectado (comportamento de latência)", statusCode, headers)
 		return "⏱️ WAF detectado (comportamento de latência)"
 	}
 
 	return ""
+}
+
+// Função auxiliar para logar deteções de WAF
+func logWAFDetection(vendor, reason string, statusCode int, headers http.Header) {
+	log.Printf("Detectado %s → Razão: %s | Status: %d | Headers: %v", vendor, reason, statusCode, headers)
 }
 
 // ClassificarVazamento identifica o tipo de vazamento encontrado
@@ -84,20 +99,31 @@ func CompararRespostas(resp1, resp2 *http.Response) bool {
 		return true
 	}
 
-	body2, err := io.ReadAll(resp2.Body)
-	if err != nil {
+	// Leitura dos corpos das respostas
+	body1, err1 := io.ReadAll(resp1.Body)
+	if err1 != nil {
 		return true
 	}
+	defer resp1.Body.Close()
 
-	bodyStr := strings.ToLower(string(body2))
+	body2, err2 := io.ReadAll(resp2.Body)
+	if err2 != nil {
+		return true
+	}
+	defer resp2.Body.Close()
+
+	// Convertemos as respostas para minúsculas para normalizar antes da comparação
+	str1 := strings.ToLower(string(body1))
+	str2 := strings.ToLower(string(body2))
 
 	// Comparação mais inteligente usando Levenshtein ou outro algoritmo de similaridade
-	if levenshteinDistance(bodyStr, bodyStr) > 10 {
+	if levenshteinDistance(str1, str2) > 10 {
 		return true
 	}
 
 	// Comparação de conteúdo usando palavras-chave
-	if strings.Contains(bodyStr, "denied") || strings.Contains(bodyStr, "forbidden") {
+	if strings.Contains(str1, "denied") || strings.Contains(str2, "denied") ||
+		strings.Contains(str1, "forbidden") || strings.Contains(str2, "forbidden") {
 		return true
 	}
 
@@ -128,7 +154,6 @@ func AnalisarHeader(header http.Header) string {
 }
 
 // LevenshteinDistance calcula a distância de Levenshtein entre duas strings
-// Função otimizada para detectar mudanças de conteúdo entre as respostas HTTP
 func levenshteinDistance(a, b string) int {
 	// Criação da matriz de distâncias
 	var matrix [][]int
